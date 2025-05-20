@@ -5,6 +5,7 @@
 #include "ggml-cpu-traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include <my_malloc.h>
 
 #include <cctype>
 #include <string>
@@ -101,7 +102,11 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+#ifdef GGML_MY_MALLOC
+    my_free(cpu_ctx->work_data);
+#else
     delete[] cpu_ctx->work_data;
+#endif
     delete cpu_ctx;
     delete backend;
 }
@@ -156,8 +161,13 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
+#ifdef GGML_MY_MALLOC
+        my_free(cpu_ctx->work_data);
+        cpu_ctx->work_data = (uint8_t*)my_malloc(cplan.work_size);
+#else
         delete[] cpu_ctx->work_data;
         cpu_ctx->work_data = new uint8_t[cplan.work_size];
+#endif
         if (cpu_ctx->work_data == NULL) {
             cpu_ctx->work_size = 0;
             return GGML_STATUS_ALLOC_FAILED;

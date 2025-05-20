@@ -6,6 +6,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include <my_malloc.h>
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -306,6 +307,12 @@ void * ggml_aligned_malloc(size_t size) {
             result = EFAULT;
             break;
     }
+  #elif GGML_MY_MALLOC
+    int result = 0;
+    aligned_memory = my_malloc(size);
+    if (aligned_memory == NULL) {
+        result = ENOMEM;
+    }
   #else
     int result = posix_memalign(&aligned_memory, alignment, size);
   #endif
@@ -339,6 +346,8 @@ void ggml_aligned_free(void * ptr, size_t size) {
     if (ptr != NULL) {
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)ptr, size);
     }
+#elif GGML_MY_MALLOC
+    my_free(ptr);
 #else
     free(ptr);
 #endif
