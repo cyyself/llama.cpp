@@ -58,6 +58,8 @@ extern "C" void* my_malloc(size_t size) {
     if (! my_malloc_initialized) {
         my_malloc_init();
     }
+    // pad size to multiple of 64
+    size = (size + 63) & ~63;
     auto it = free_memory.lower_bound(std::make_pair(size, nullptr));
     if (it == free_memory.end()) {
         return nullptr;
