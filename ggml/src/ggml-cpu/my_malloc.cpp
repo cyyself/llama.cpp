@@ -10,12 +10,8 @@
 
 
 #ifndef RESERVED_MEMORY_SIZE
-#ifdef RESERVED_PHYS_BASE_ADDR
-#error "RESERVED_MEMORY_SIZE not defined"
-#else
 #define RESERVED_MEMORY_SIZE (1024l * 1024l * 1024l) // 1 GB
 #warning "RESERVED_MEMORY_SIZE not defined, using 1 GB"
-#endif
 #endif
 
 bool my_malloc_initialized = false;
@@ -32,7 +28,7 @@ static int my_malloc_init() {
         throw std::runtime_error("Unable to open /dev/mem");
         return -1;
     }
-    mapped_memory = mmap(nullptr, RESERVED_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, base_addr);
+    mapped_memory = mmap(nullptr, RESERVED_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, RESERVED_PHYS_BASE_ADDR);
 #else
     mapped_memory = mmap(nullptr, RESERVED_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     fprintf (stderr, "mapped_memory = %p\n", mapped_memory);
