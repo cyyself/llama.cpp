@@ -481,6 +481,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
     GGML_ASSERT(state_read_idxs->ne[0] == DSV4_HCA_RATIO*n_blocks);
     GGML_ASSERT(n_embd_head >= n_embd_head_rope);
 
+    static const bool pool_disable = std::getenv("LLAMA_DSV4_POOL_DISABLE") != nullptr;
+
+    ggml_tensor * comp = nullptr;
+    if (!pool_disable) {
+        comp = ggml_dsv4_state_pool(ctx0, kv_state, score_state, nullptr, nullptr, state_read_idxs, DSV4_HCA_RATIO, false);
+        cb(comp, name, il);
+    } else {
     ggml_tensor * kv = ggml_get_rows(ctx0, kv_state, state_read_idxs);
     kv = ggml_reshape_3d(ctx0, kv, n_embd_head, DSV4_HCA_RATIO, n_blocks);
     cb(kv, name, il);
@@ -493,10 +500,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
     ggml_tensor * scores = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
 
     ggml_tensor * weights = ggml_soft_max(ctx0, scores);
-    ggml_tensor * comp = ggml_mul(ctx0, values, weights);
+    comp = ggml_mul(ctx0, values, weights);
     comp = ggml_sum_rows(ctx0, comp);
     comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
     cb(comp, name, il);
+    }
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
     cb(comp, name, il);
@@ -524,6 +532,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
 ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_state(
         ggml_tensor * kv_state,
         ggml_tensor * score_state,
+        ggml_tensor * kv_new,
+        ggml_tensor * score_new,
         ggml_tensor * state_read_idxs,
         ggml_tensor * comp_pos,
         ggml_tensor * norm,
@@ -542,6 +552,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_sta
     GGML_ASSERT(score_state->ne[0] == 2*n_embd_head);
     GGML_ASSERT(n_embd_head >= n_embd_head_rope);
 
+    // fused gather + per-channel softmax pooling; pad row (idx == S) reads kv 0 / score -inf,
+    // matching the previous dsv4_append_zero_row + get_rows + window split + soft_max + mul + sum_rows chain
+    static const bool pool_disable = std::getenv("LLAMA_DSV4_POOL_DISABLE") != nullptr;
+
+    ggml_tensor * comp = nullptr;
+    if (!pool_disable) {
+        comp = ggml_dsv4_state_pool(ctx0, kv_state, score_state, kv_new, score_new, state_read_idxs, ratio, true);
+        cb(comp, name, il);
+    } else {
+    if (kv_new) {
+        kv_state    = ggml_concat(ctx0, kv_state, kv_new, 1);
+        score_state = ggml_concat(ctx0, score_state, score_new, 1);
+    }
     kv_state    = dsv4_append_zero_row(ctx0, kv_state,    false);
     score_state = dsv4_append_zero_row(ctx0, score_state, true);
 
@@ -577,10 +600,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_sta
     scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
 
     ggml_tensor * weights = ggml_soft_max(ctx0, scores);
-    ggml_tensor * comp = ggml_mul(ctx0, values, weights);
+    comp = ggml_mul(ctx0, values, weights);
     comp = ggml_sum_rows(ctx0, comp);
     comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
     cb(comp, name, il);
+    }
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
     cb(comp, name, il);
@@ -1023,12 +1047,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_tensor * csa_base_score = dsv4_view_2d(
                 ctx0, csa_restored.score, csa_restored.score->ne[0], csa_state->get_n_rows(), 0);
 
-        ggml_tensor * csa_source_kv = ggml_concat(ctx0, csa_base_kv, csa_state_kv, 1);
-        ggml_tensor * csa_source_score = ggml_concat(ctx0, csa_base_score, csa_state_score, 1);
-
         ggml_tensor * kv_comp_csa_state = build_overlap_compressed_kv_from_state(
-                csa_source_kv,
-                csa_source_score,
+                csa_base_kv,
+                csa_base_score,
+                csa_state_kv,
+                csa_state_score,
                 inp_dsv4->get_csa().state_read_idxs,
                 inp_dsv4->get_csa().state_write_pos,
                 layer.attn_comp_norm,
@@ -1092,12 +1115,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_tensor * lid_base_score = dsv4_view_2d(
                 ctx0, lid_restored.score, lid_restored.score->ne[0], lid_state->get_n_rows(), 0);
 
-        ggml_tensor * lid_source_kv = ggml_concat(ctx0, lid_base_kv, lid_state_kv, 1);
-        ggml_tensor * lid_source_score = ggml_concat(ctx0, lid_base_score, lid_state_score, 1);
-
         ggml_tensor * kv_comp_lid_state = build_overlap_compressed_kv_from_state(
-                lid_source_kv,
-                lid_source_score,
+                lid_base_kv,
+                lid_base_score,
+                lid_state_kv,
+                lid_state_score,
                 inp_dsv4->get_lid().state_read_idxs,
                 inp_dsv4->get_lid().state_write_pos,
                 layer.indexer_comp_norm,

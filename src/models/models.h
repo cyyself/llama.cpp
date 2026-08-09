@@ -1180,6 +1180,8 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_overlap_compressed_kv_from_state(
                 ggml_tensor * kv_state,
                 ggml_tensor * score_state,
+                ggml_tensor * kv_new,
+                ggml_tensor * score_new,
                 ggml_tensor * state_read_idxs,
                 ggml_tensor * comp_pos,
                 ggml_tensor * norm,

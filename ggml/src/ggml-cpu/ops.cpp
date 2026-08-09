@@ -11229,6 +11229,82 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_dsv4_state_pool
+
+void ggml_compute_forward_dsv4_state_pool(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kv     = dst->src[0];
+    const ggml_tensor * score  = dst->src[1];
+    const ggml_tensor * idxs   = dst->src[2];
+    const ggml_tensor * kv_n   = dst->src[3];
+    const ggml_tensor * score_n = dst->src[4];
+
+    GGML_ASSERT(kv->type == GGML_TYPE_F32 && score->type == GGML_TYPE_F32 && idxs->type == GGML_TYPE_I32);
+
+    const int64_t n_new = kv_n ? kv_n->ne[1] : 0;
+
+    const int32_t ratio   = ggml_get_op_params_i32(dst, 0);
+    const bool    overlap = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int64_t n_entries = (overlap ? 2 : 1)*ratio;
+    const int64_t D         = dst->ne[0];
+    const int64_t n_blocks  = dst->ne[2];
+    const int64_t S         = kv->ne[1];
+
+    const int32_t * ii = (const int32_t *) idxs->data;
+
+    // split blocks over threads
+    for (int64_t b = params->ith; b < n_blocks; b += params->nth) {
+        for (int64_t d = 0; d < D; ++d) {
+#define DSV4_POOL_LOAD(r, val, sc) \
+            do { \
+                int64_t row_; \
+                int64_t w_off_; \
+                if (overlap && (r) >= ratio) { \
+                    row_   = ii[ratio*n_blocks + b*ratio + (r) - ratio]; \
+                    w_off_ = D; \
+                } else { \
+                    row_   = ii[b*ratio + (r)]; \
+                    w_off_ = 0; \
+                } \
+                if (row_ < S) { \
+                    (val) = *(const float *) ((const char *) kv->data    + row_*kv->nb[1]    + (w_off_ + d)*kv->nb[0]); \
+                    (sc)  = *(const float *) ((const char *) score->data + row_*score->nb[1] + (w_off_ + d)*score->nb[0]); \
+                } else if (row_ < S + n_new) { \
+                    (val) = *(const float *) ((const char *) kv_n->data    + (row_ - S)*kv_n->nb[1]    + (w_off_ + d)*kv_n->nb[0]); \
+                    (sc)  = *(const float *) ((const char *) score_n->data + (row_ - S)*score_n->nb[1] + (w_off_ + d)*score_n->nb[0]); \
+                } else { \
+                    (val) = 0.0f; \
+                    (sc)  = -INFINITY; \
+                } \
+            } while (0)
+
+            float max = -INFINITY;
+            for (int64_t r = 0; r < n_entries; ++r) {
+                float v, sc;
+                DSV4_POOL_LOAD(r, v, sc);
+                max = MAX(max, sc);
+            }
+            float sum = 0.0f;
+            for (int64_t r = 0; r < n_entries; ++r) {
+                float v, sc;
+                DSV4_POOL_LOAD(r, v, sc);
+                sum += expf(sc - max);
+            }
+            float acc = 0.0f;
+            for (int64_t r = 0; r < n_entries; ++r) {
+                float v, sc;
+                DSV4_POOL_LOAD(r, v, sc);
+                acc += v*(expf(sc - max)/sum);
+            }
+#undef DSV4_POOL_LOAD
+
+            *(float *) ((char *) dst->data + b*dst->nb[2] + d*dst->nb[0]) = acc;
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

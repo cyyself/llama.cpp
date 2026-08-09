@@ -292,3 +292,175 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }
+
+template <int n_entries>
+static __global__ void dsv4_state_pool_f32(
+        const float * GGML_CUDA_RESTRICT kv, const float * GGML_CUDA_RESTRICT score,
+        const float * GGML_CUDA_RESTRICT kv_n, const float * GGML_CUDA_RESTRICT score_n,
+        const int32_t * GGML_CUDA_RESTRICT idxs, float * GGML_CUDA_RESTRICT dst,
+        const int D, const int n_blocks, const int S, const int n_new, const int ratio, const int overlap,
+        const int64_t kv_s1, const int64_t score_s1, const int64_t kv_n_s1, const int64_t score_n_s1) {
+    const int d = blockIdx.x*blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (d >= D) {
+        return;
+    }
+
+    float vals[n_entries];
+    float scs [n_entries];
+#pragma unroll
+    for (int r = 0; r < n_entries; ++r) {
+        int row;
+        int w_off;
+        if (overlap && r >= ratio) {
+            row   = idxs[ratio*n_blocks + b*ratio + r - ratio];
+            w_off = D;
+        } else {
+            row   = idxs[b*ratio + r];
+            w_off = 0;
+        }
+        if (row < S) {
+            vals[r] = kv   [row*kv_s1    + w_off + d];
+            scs [r] = score[row*score_s1 + w_off + d];
+        } else if (row < S + n_new) {
+            vals[r] = kv_n   [(row - S)*kv_n_s1    + w_off + d];
+            scs [r] = score_n[(row - S)*score_n_s1 + w_off + d];
+        } else {
+            vals[r] = 0.0f;
+            scs [r] = -INFINITY;
+        }
+    }
+
+    float mx = -INFINITY;
+#pragma unroll
+    for (int r = 0; r < n_entries; ++r) {
+        mx = fmaxf(mx, scs[r]);
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int r = 0; r < n_entries; ++r) {
+        scs[r] = expf(scs[r] - mx);
+        sum += scs[r];
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (int r = 0; r < n_entries; ++r) {
+        acc += vals[r]*(scs[r]/sum);
+    }
+
+    dst[(int64_t) b*D + d] = acc;
+}
+
+// runtime-loop variant for large entry counts (e.g. hca ratio 128), 3 passes with recomputed gathers
+static __global__ void dsv4_state_pool_large_f32(
+        const float * GGML_CUDA_RESTRICT kv, const float * GGML_CUDA_RESTRICT score,
+        const float * GGML_CUDA_RESTRICT kv_n, const float * GGML_CUDA_RESTRICT score_n,
+        const int32_t * GGML_CUDA_RESTRICT idxs, float * GGML_CUDA_RESTRICT dst,
+        const int D, const int n_blocks, const int S, const int n_new, const int ratio, const int overlap, const int n_entries,
+        const int64_t kv_s1, const int64_t score_s1, const int64_t kv_n_s1, const int64_t score_n_s1) {
+    const int d = blockIdx.x*blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (d >= D) {
+        return;
+    }
+
+#define DSV4_POOL_LOAD(r, val, sc)                                          \
+    do {                                                                    \
+        int row_;                                                           \
+        int w_off_;                                                         \
+        if (overlap && (r) >= ratio) {                                      \
+            row_   = idxs[ratio*n_blocks + b*ratio + (r) - ratio];          \
+            w_off_ = D;                                                     \
+        } else {                                                            \
+            row_   = idxs[b*ratio + (r)];                                   \
+            w_off_ = 0;                                                     \
+        }                                                                   \
+        if (row_ < S) {                                                     \
+            (val) = kv   [row_*kv_s1    + w_off_ + d];                      \
+            (sc)  = score[row_*score_s1 + w_off_ + d];                      \
+        } else if (row_ < S + n_new) {                                      \
+            (val) = kv_n   [(row_ - S)*kv_n_s1    + w_off_ + d];            \
+            (sc)  = score_n[(row_ - S)*score_n_s1 + w_off_ + d];            \
+        } else {                                                            \
+            (val) = 0.0f;                                                   \
+            (sc)  = -INFINITY;                                              \
+        }                                                                   \
+    } while (0)
+
+    float mx = -INFINITY;
+    for (int r = 0; r < n_entries; ++r) {
+        float v, sc;
+        DSV4_POOL_LOAD(r, v, sc);
+        mx = fmaxf(mx, sc);
+    }
+    float sum = 0.0f;
+    for (int r = 0; r < n_entries; ++r) {
+        float v, sc;
+        DSV4_POOL_LOAD(r, v, sc);
+        sum += expf(sc - mx);
+    }
+    float acc = 0.0f;
+    for (int r = 0; r < n_entries; ++r) {
+        float v, sc;
+        DSV4_POOL_LOAD(r, v, sc);
+        acc += v*(expf(sc - mx)/sum);
+    }
+#undef DSV4_POOL_LOAD
+
+    dst[(int64_t) b*D + d] = acc;
+}
+
+void ggml_cuda_op_dsv4_state_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * kv      = dst->src[0];
+    const ggml_tensor * score   = dst->src[1];
+    const ggml_tensor * idxs    = dst->src[2];
+    const ggml_tensor * kv_n    = dst->src[3];
+    const ggml_tensor * score_n = dst->src[4];
+
+    GGML_ASSERT(kv->type == GGML_TYPE_F32 && score->type == GGML_TYPE_F32 && idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv->nb[0] == sizeof(float) && score->nb[0] == sizeof(float));
+    GGML_ASSERT(!kv_n || (kv_n->nb[0] == sizeof(float) && score_n->nb[0] == sizeof(float)));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int ratio   = ggml_get_op_params_i32(dst, 0);
+    const int overlap = ggml_get_op_params_i32(dst, 1);
+
+    const int n_entries = (overlap ? 2 : 1)*ratio;
+    const int D         = dst->ne[0];
+    const int n_blocks  = dst->ne[2];
+    const int S         = kv->ne[1];
+
+    const int64_t kv_s1    = kv->nb[1]/sizeof(float);
+    const int64_t score_s1 = score->nb[1]/sizeof(float);
+
+    const int     n_new      = kv_n ? (int) kv_n->ne[1] : 0;
+    const int64_t kv_n_s1    = kv_n    ? (int64_t) (kv_n->nb[1]/sizeof(float))    : 0;
+    const int64_t score_n_s1 = score_n ? (int64_t) (score_n->nb[1]/sizeof(float)) : 0;
+    const float * kv_n_d     = kv_n    ? (const float *) kv_n->data    : nullptr;
+    const float * score_n_d  = score_n ? (const float *) score_n->data : nullptr;
+
+    const int block_size = 256;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((D + block_size - 1)/block_size, n_blocks, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    switch (n_entries) {
+#define DSV4_POOL_CASE(N) \
+        case N: ggml_cuda_kernel_launch(dsv4_state_pool_f32<N>, lp, \
+                (const float *) kv->data, (const float *) score->data, kv_n_d, score_n_d, (const int32_t *) idxs->data, (float *) dst->data, \
+                D, n_blocks, S, n_new, ratio, overlap, kv_s1, score_s1, kv_n_s1, score_n_s1); break;
+        DSV4_POOL_CASE(2)
+        DSV4_POOL_CASE(4)
+        DSV4_POOL_CASE(6)
+        DSV4_POOL_CASE(8)
+        DSV4_POOL_CASE(12)
+        DSV4_POOL_CASE(16)
+#undef DSV4_POOL_CASE
+        default:
+            GGML_ASSERT(n_entries <= 128);
+            ggml_cuda_kernel_launch(dsv4_state_pool_large_f32, lp,
+                (const float *) kv->data, (const float *) score->data, kv_n_d, score_n_d, (const int32_t *) idxs->data, (float *) dst->data,
+                D, n_blocks, S, n_new, ratio, overlap, n_entries, kv_s1, score_s1, kv_n_s1, score_n_s1);
+            break;
+    }
+}

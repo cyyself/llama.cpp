@@ -8030,6 +8030,53 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+struct test_dsv4_state_pool : public test_case {
+    const int64_t d;
+    const int64_t s;
+    const int64_t ratio;
+    const int64_t n_blocks;
+    const bool    overlap;
+    const int64_t n_new;
+
+    std::string vars() override {
+        return VARS_TO_STR6(d, s, ratio, n_blocks, overlap, n_new);
+    }
+
+    test_dsv4_state_pool(int64_t d = 512, int64_t s = 32, int64_t ratio = 4, int64_t n_blocks = 2, bool overlap = true, int64_t n_new = 0)
+        : d(d), s(s), ratio(ratio), n_blocks(n_blocks), overlap(overlap), n_new(n_new) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t w = overlap ? 2*d : d;
+        ggml_tensor * kv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w, s);
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w, s);
+        ggml_tensor * idxs  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (overlap ? 2 : 1)*ratio*n_blocks);
+        ggml_set_name(idxs, "idxs");
+        ggml_tensor * kv_new    = nullptr;
+        ggml_tensor * score_new = nullptr;
+        if (n_new > 0) {
+            kv_new    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w, n_new);
+            score_new = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w, n_new);
+        }
+        ggml_tensor * out = ggml_dsv4_state_pool(ctx, kv, score, kv_new, score_new, idxs, (int32_t) ratio, overlap);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % (s + n_new + 1); // top index selects the padding row
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -8975,6 +9022,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  4, 1,  8192, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 24, 1,  9216, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 79, 1,  8192, {1, 1}, {1, 1}));
+
+    // dsv4 fused state pooling
+    test_cases.emplace_back(new test_dsv4_state_pool(512, 32, 4, 1, true));
+    test_cases.emplace_back(new test_dsv4_state_pool(512, 32, 4, 3, true));
+    test_cases.emplace_back(new test_dsv4_state_pool(512,  5, 8, 2, true));
+    test_cases.emplace_back(new test_dsv4_state_pool( 64,  2, 4, 2, true));
+    test_cases.emplace_back(new test_dsv4_state_pool(128, 32, 4, 2, false));
+    test_cases.emplace_back(new test_dsv4_state_pool(512, 200, 128, 2, false));
+    test_cases.emplace_back(new test_dsv4_state_pool(512, 40, 16, 2, true));
+    test_cases.emplace_back(new test_dsv4_state_pool(512, 32, 4, 2, true, 1));
+    test_cases.emplace_back(new test_dsv4_state_pool(512, 32, 4, 3, true, 4));
+    test_cases.emplace_back(new test_dsv4_state_pool(512, 200, 128, 2, false, 2));
 
     // small-weight bf16 matvecs (CUDA rows-split path)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 1, 4096, {1, 1}, {1, 1}));

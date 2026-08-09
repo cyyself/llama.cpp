@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_STATE_POOL,
 
         GGML_OP_UNARY,
 
@@ -2639,6 +2640,24 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // dsv4_state_pool: per-channel softmax-weighted pooling of gathered compressor state rows
+    // kv_state/score_state [W, S] f32, idxs [n_entries_per_block*n_blocks] i32
+    // idx == S selects a padding row (kv 0, score -inf)
+    // plain   (overlap=false): W = D, entry r of block b reads row idxs[b*ratio + r]
+    // overlap (overlap=true):  W = 2*D, entries 0..ratio read channels [0,D) of rows idxs[b*ratio + r],
+    //                          entries ratio..2*ratio read channels [D,2D) of rows idxs[ratio*n_blocks + b*ratio + r - ratio]
+    // out [D, 1, n_blocks]: out[d,0,b] = sum_r kv_r[d] * softmax_r(score_r[d])
+    // kv_new/score_new (optional, [W, n_new]): rows addressed as S + j for j in [0, n_new); larger idx pads
+    GGML_API struct ggml_tensor * ggml_dsv4_state_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_state,
+            struct ggml_tensor  * score_state,
+            struct ggml_tensor  * kv_new,
+            struct ggml_tensor  * score_new,
+            struct ggml_tensor  * idxs,
+            int32_t               ratio,
+            bool                  overlap);
 
     // custom operators
 
