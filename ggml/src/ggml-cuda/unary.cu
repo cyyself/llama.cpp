@@ -644,3 +644,70 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// fused y = s*sigmoid(x*a + b) + c with a, b broadcast over rows (dsv4 hyper-connection gates)
+static __global__ void fused_gate_sigmoid_f32(
+        const float * GGML_CUDA_RESTRICT x, const float * GGML_CUDA_RESTRICT a, const float * GGML_CUDA_RESTRICT b,
+        float * GGML_CUDA_RESTRICT dst, const int64_t n, const int ne0, const int a_stride, const int b_stride,
+        const float s, const float c) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int i0 = i % ne0;
+    const float v = __fadd_rn(__fmul_rn(x[i], a[a_stride ? i0 : 0]), b[b_stride ? i0 : 0]);
+    dst[i] = s*op_sigmoid(v) + c;
+}
+
+void ggml_cuda_op_fused_gate_sigmoid(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mul, const ggml_tensor * add, ggml_tensor * scale_dst) {
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * a = mul->src[1];
+    const ggml_tensor * b = add->src[1];
+
+    const float s = ggml_get_op_params_f32(scale_dst, 0);
+    const float c = ggml_get_op_params_f32(scale_dst, 1);
+
+    const int64_t n = ggml_nelements(scale_dst);
+    const int ne0 = x->ne[0];
+    const int a_stride = a->ne[0] == 1 ? 0 : 1;
+    const int b_stride = b->ne[0] == 1 ? 0 : 1;
+
+    const int block_size = 256;
+    const int64_t n_blocks = (n + block_size - 1)/block_size;
+    fused_gate_sigmoid_f32<<<n_blocks, block_size, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) a->data, (const float *) b->data,
+            (float *) scale_dst->data, n, ne0, a_stride, b_stride, s, c);
+}
+
+// fused y = x*a + z with a, z same-shape, row, or scalar
+static __global__ void fused_mul_add_f32(
+        const float * GGML_CUDA_RESTRICT x, const float * GGML_CUDA_RESTRICT a, const float * GGML_CUDA_RESTRICT z,
+        float * GGML_CUDA_RESTRICT dst, const int64_t n, const int ne0, const int a_mode, const int z_mode) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int i0 = i % ne0;
+    const float av = a_mode == 2 ? a[i] : (a_mode == 1 ? a[i0] : a[0]);
+    const float zv = z_mode == 2 ? z[i] : (z_mode == 1 ? z[i0] : z[0]);
+    dst[i] = __fadd_rn(__fmul_rn(x[i], av), zv);
+}
+
+void ggml_cuda_op_fused_mul_add(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * x, const ggml_tensor * a, const ggml_tensor * z, ggml_tensor * dst) {
+    const int64_t n = ggml_nelements(dst);
+    const int ne0 = dst->ne[0];
+
+    auto mode = [&](const ggml_tensor * t) {
+        if (ggml_nelements(t) == n) return 2;
+        if (t->ne[0] == ne0)        return 1;
+        return 0;
+    };
+
+    const int block_size = 256;
+    const int64_t n_blocks = (n + block_size - 1)/block_size;
+    fused_mul_add_f32<<<n_blocks, block_size, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) a->data, (const float *) z->data,
+            (float *) dst->data, n, ne0, mode(a), mode(z));
+}

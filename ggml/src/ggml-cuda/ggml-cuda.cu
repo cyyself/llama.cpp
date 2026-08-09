@@ -3433,6 +3433,91 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // dsv4 hyper-connection gate: y = s*sigmoid(x*a + b) + c with a, b row vectors or scalars.
+    // the chain may have view nodes interleaved, walk to the next real node at each step.
+    if (node->op == GGML_OP_MUL) {
+        int idx[4] = { i, -1, -1, -1 };
+        const ggml_op want[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+        int k = i;
+        bool shape_ok = true;
+        for (int step = 0; step < 3 && shape_ok; ++step) {
+            ++k;
+            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                ++k;
+            }
+            if (k >= cgraph->n_nodes || cgraph->nodes[k]->op != want[step]) {
+                shape_ok = false;
+                break;
+            }
+            idx[step + 1] = k;
+        }
+
+        if (shape_ok) {
+            ggml_tensor * mul_n   = cgraph->nodes[idx[0]];
+            ggml_tensor * add_n   = cgraph->nodes[idx[1]];
+            ggml_tensor * unary_n = cgraph->nodes[idx[2]];
+            ggml_tensor * scale_n = cgraph->nodes[idx[3]];
+
+            const ggml_tensor * x = mul_n->src[0];
+            const ggml_tensor * a = mul_n->src[1];
+            const ggml_tensor * b = add_n->src[1];
+
+            const bool linked = add_n->src[0] == mul_n && unary_n->src[0] == add_n && scale_n->src[0] == unary_n &&
+                    ggml_node_has_n_uses(cgraph, idx[0], 1) && ggml_node_has_n_uses(cgraph, idx[1], 1) &&
+                    ggml_node_has_n_uses(cgraph, idx[2], 1);
+            const bool bcast_ok = a && b &&
+                    (a->ne[0] == x->ne[0] || a->ne[0] == 1) && a->ne[1] == 1 && a->ne[2] == 1 && a->ne[3] == 1 &&
+                    (b->ne[0] == x->ne[0] || b->ne[0] == 1) && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1;
+
+            if (linked && bcast_ok && ggml_get_unary_op(unary_n) == GGML_UNARY_OP_SIGMOID &&
+                    x->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                    scale_n->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(x) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                    ggml_is_contiguous(scale_n) && ggml_are_same_shape(x, scale_n) &&
+                    !(scale_n->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    !(mul_n->flags & GGML_TENSOR_FLAG_OUTPUT) && !(add_n->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    !(unary_n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                ggml_cuda_op_fused_gate_sigmoid(*cuda_ctx, mul_n, add_n, scale_n);
+                return idx[3] - i;
+            }
+        }
+    }
+
+    // fused y = x*a + z: MUL directly followed by single-use ADD (with views possibly interleaved)
+    if (node->op == GGML_OP_MUL) {
+        int k = i + 1;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            ++k;
+        }
+        if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_ADD) {
+            ggml_tensor * mul_n = cgraph->nodes[i];
+            ggml_tensor * add_n = cgraph->nodes[k];
+
+            const ggml_tensor * x = mul_n->src[0];
+            const ggml_tensor * a = mul_n->src[1];
+            const ggml_tensor * z = add_n->src[0] == mul_n ? add_n->src[1] : add_n->src[0];
+
+            auto bcast_ok = [&](const ggml_tensor * t) {
+                if (ggml_are_same_shape(t, mul_n)) return true;
+                return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 && (t->ne[0] == mul_n->ne[0] || t->ne[0] == 1);
+            };
+
+            const bool linked = (add_n->src[0] == mul_n || add_n->src[1] == mul_n) &&
+                    ggml_node_has_n_uses(cgraph, i, 1) && !(mul_n->flags & GGML_TENSOR_FLAG_OUTPUT);
+
+            if (linked && x && a && z &&
+                    ggml_are_same_shape(x, mul_n) && ggml_are_same_shape(add_n, mul_n) &&
+                    bcast_ok(a) && bcast_ok(z) &&
+                    x->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 &&
+                    add_n->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(x) && ggml_is_contiguous(a) && ggml_is_contiguous(z) &&
+                    ggml_is_contiguous(add_n)) {
+                ggml_cuda_op_fused_mul_add(*cuda_ctx, x, a, z, add_n);
+                return k - i;
+            }
+        }
+    }
+
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 

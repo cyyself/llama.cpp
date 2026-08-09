@@ -112,3 +112,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
     out_glu = out_glu * (1.0f + g);
     return out_glu;
 }
+
+void ggml_cuda_op_fused_gate_sigmoid(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, const ggml_tensor * add, ggml_tensor * scale_dst);
+void ggml_cuda_op_fused_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * a, const ggml_tensor * z, ggml_tensor * dst);
