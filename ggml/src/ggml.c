@@ -4182,8 +4182,11 @@ static struct ggml_tensor * ggml_rope_impl(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        bool                  inplace) {
+        bool                  inplace,
+        int                   n_dims_start) {
     GGML_ASSERT((mode & 1) == 0 && "mode & 1 == 1 is no longer supported");
+    GGML_ASSERT(n_dims_start >= 0 && n_dims_start % 2 == 0 && n_dims_start + n_dims <= a->ne[0]);
+    GGML_ASSERT(n_dims_start == 0 || !(mode & GGML_ROPE_TYPE_MROPE));
 
     GGML_ASSERT(ggml_is_vector(b));
     GGML_ASSERT(b->type == GGML_TYPE_I32);
@@ -4202,7 +4205,7 @@ static struct ggml_tensor * ggml_rope_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, n_dims_start, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
@@ -4231,7 +4234,7 @@ struct ggml_tensor * ggml_rope(
         int                   n_dims,
         int                   mode) {
     return ggml_rope_impl(
-        ctx, a, b, NULL, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false
+        ctx, a, b, NULL, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false, 0
     );
 }
 
@@ -4252,7 +4255,7 @@ struct ggml_tensor * ggml_rope_multi(
         float                 beta_slow) {
     return ggml_rope_impl(
         ctx, a, b, c, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale,
-        ext_factor, attn_factor, beta_fast, beta_slow, false
+        ext_factor, attn_factor, beta_fast, beta_slow, false, 0
     );
 }
 
@@ -4273,7 +4276,7 @@ struct ggml_tensor * ggml_rope_multi_inplace(
         float                 beta_slow) {
     return ggml_rope_impl(
         ctx, a, b, c, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale,
-        ext_factor, attn_factor, beta_fast, beta_slow, true
+        ext_factor, attn_factor, beta_fast, beta_slow, true, 0
     );
 }
 
@@ -4284,7 +4287,7 @@ struct ggml_tensor * ggml_rope_inplace(
         int                   n_dims,
         int                   mode) {
     return ggml_rope_impl(
-        ctx, a, b, NULL, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, true
+        ctx, a, b, NULL, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, true, 0
     );
 }
 
@@ -4304,7 +4307,28 @@ struct ggml_tensor * ggml_rope_ext(
         float                 beta_slow) {
     return ggml_rope_impl(
         ctx, a, b, c, n_dims, NULL, mode, n_ctx_orig, freq_base, freq_scale,
-        ext_factor, attn_factor, beta_fast, beta_slow, false
+        ext_factor, attn_factor, beta_fast, beta_slow, false, 0
+    );
+}
+
+struct ggml_tensor * ggml_rope_ext_region(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        int                   n_dims,
+        int                   n_dims_start,
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    return ggml_rope_impl(
+        ctx, a, b, c, n_dims, NULL, mode, n_ctx_orig, freq_base, freq_scale,
+        ext_factor, attn_factor, beta_fast, beta_slow, false, n_dims_start
     );
 }
 
@@ -4324,7 +4348,7 @@ struct ggml_tensor * ggml_rope_ext_inplace(
         float                 beta_slow) {
     return ggml_rope_impl(
         ctx, a, b, c, n_dims, NULL, mode, n_ctx_orig, freq_base, freq_scale,
-        ext_factor, attn_factor, beta_fast, beta_slow, true
+        ext_factor, attn_factor, beta_fast, beta_slow, true, 0
     );
 }
 
@@ -4343,7 +4367,7 @@ struct ggml_tensor * ggml_rope_custom(
         float                 beta_slow) {
     return ggml_rope_impl(
         ctx, a, b, NULL, n_dims, NULL, mode, n_ctx_orig, freq_base, freq_scale,
-        ext_factor, attn_factor, beta_fast, beta_slow, false
+        ext_factor, attn_factor, beta_fast, beta_slow, false, 0
     );
 }
 
@@ -4362,7 +4386,7 @@ struct ggml_tensor * ggml_rope_custom_inplace(
         float                 beta_slow) {
     return ggml_rope_impl(
         ctx, a, b, NULL, n_dims, NULL, mode, n_ctx_orig, freq_base, freq_scale,
-        ext_factor, attn_factor, beta_fast, beta_slow, true
+        ext_factor, attn_factor, beta_fast, beta_slow, true, 0
     );
 }
 

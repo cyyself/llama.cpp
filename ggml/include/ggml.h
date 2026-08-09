@@ -1837,6 +1837,23 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow);
 
+    // rope only dims [n_dims_start, n_dims_start + n_dims), pass the other dims through unchanged
+    GGML_API struct ggml_tensor * ggml_rope_ext_region(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            int                   n_dims,
+            int                   n_dims_start,
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow);
+
     // multi-dimensional RoPE, for Qwen-VL and similar vision models
     // mode can be either VISION, MROPE, IMROPE, cannot be combined with NORMAL or NEOX
     // sections specify how many dimensions to rotate in each section:
