@@ -671,6 +671,10 @@ static __global__ void mul_mat_vec_q(
                             gate_value *= gate_scales;
                         }
                         gate_value += gate_biases[j];
+                        if (fusion.has_clamp) {
+                            result     = fminf(fmaxf(result, -fusion.clamp_limit), fusion.clamp_limit);
+                            gate_value = fminf(gate_value, fusion.clamp_limit);
+                        }
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
@@ -1213,7 +1217,9 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
-        fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_op      = fusion->glu_op;
+        fusion_local.has_clamp   = fusion->has_clamp;
+        fusion_local.clamp_limit = fusion->clamp_limit;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

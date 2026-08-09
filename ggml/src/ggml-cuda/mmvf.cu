@@ -354,6 +354,10 @@ static __global__ void mul_mat_vec_f(
             if (use_gate_bias) {
                 gate_value += gate_bias[tid*stride_col_dst + row];
             }
+            if (fusion.has_clamp) {
+                value      = fminf(fmaxf(value, -fusion.clamp_limit), fusion.clamp_limit);
+                gate_value = fminf(gate_value, fusion.clamp_limit);
+            }
             switch (glu_op) {
                 case GGML_GLU_OP_SWIGLU:
                     value *= ggml_cuda_op_silu_single(gate_value);
@@ -674,7 +678,9 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
-        fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_op      = fusion->glu_op;
+        fusion_local.has_clamp   = fusion->has_clamp;
+        fusion_local.clamp_limit = fusion->clamp_limit;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

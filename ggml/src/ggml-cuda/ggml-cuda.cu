@@ -1753,6 +1753,51 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+// clamped swiglu (deepseek4): glu(clamp(gate, -inf, limit), clamp(up, -limit, limit))
+static bool ggml_cuda_should_fuse_mul_mat_clamp(const ggml_tensor * ffn_up,
+                                                const ggml_tensor * ffn_gate,
+                                                const ggml_tensor * glu,
+                                                const ggml_tensor * ffn_up_clamp,
+                                                const ggml_tensor * ffn_gate_clamp) {
+    static bool dbg = getenv("GGML_CLAMP_FUSION_DEBUG") != nullptr;
+
+    if (ffn_up_clamp->op != GGML_OP_CLAMP || ffn_gate_clamp->op != GGML_OP_CLAMP) {
+        if (dbg) fprintf(stderr, "clamp_fuse reject [ops] %s\n", glu->name);
+        return false;
+    }
+    if (ffn_up_clamp->src[0] != ffn_up || ffn_gate_clamp->src[0] != ffn_gate) {
+        if (dbg) fprintf(stderr, "clamp_fuse reject [clamp srcs] %s\n", glu->name);
+        return false;
+    }
+    if (glu->src[0] != ffn_gate_clamp || glu->src[1] != ffn_up_clamp) {
+        if (dbg) fprintf(stderr, "clamp_fuse reject [glu srcs] %s\n", glu->name);
+        return false;
+    }
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        if (dbg) fprintf(stderr, "clamp_fuse reject [glu op] %s\n", glu->name);
+        return false;
+    }
+
+    const float up_min   = ggml_get_op_params_f32(ffn_up_clamp,   0);
+    const float up_max   = ggml_get_op_params_f32(ffn_up_clamp,   1);
+    const float gate_min = ggml_get_op_params_f32(ffn_gate_clamp, 0);
+    const float gate_max = ggml_get_op_params_f32(ffn_gate_clamp, 1);
+
+    if (!(up_max > 0.0f) || up_min != -up_max || gate_max != up_max || gate_min != -INFINITY) {
+        if (dbg) fprintf(stderr, "clamp_fuse reject [limits %g %g %g %g] %s\n", up_min, up_max, gate_min, gate_max, glu->name);
+        return false;
+    }
+
+    // reuse the mul_mat compatibility checks (types, shared src1, ids)
+    ggml_tensor glu_direct = *glu;
+    glu_direct.src[0] = ffn_gate_clamp->src[0];
+    glu_direct.src[1] = ffn_up_clamp->src[0];
+
+    const bool ok = ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, &glu_direct);
+    if (dbg && !ok) fprintf(stderr, "clamp_fuse reject [mul_mat checks, types %d/%d] %s\n", ffn_up->src[0]->type, ffn_gate->src[0]->type, glu->name);
+    return ok;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -2968,6 +3013,44 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> mul_mat_clamp_glu_ops    = { GGML_OP_MUL_MAT,    GGML_OP_CLAMP, GGML_OP_MUL_MAT,    GGML_OP_CLAMP, GGML_OP_GLU };
+    std::initializer_list<enum ggml_op> mul_mat_id_clamp_glu_ops = { GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP, GGML_OP_GLU };
+
+    if (is_equal(mul_mat_clamp_glu_ops, ops) || is_equal(mul_mat_id_clamp_glu_ops, ops)) {
+        static bool dbg = getenv("GGML_CLAMP_FUSION_DEBUG") != nullptr;
+
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
+            if (dbg && node_idx + 4 < cgraph->n_nodes &&
+                cgraph->nodes[node_idx + 1]->op == GGML_OP_CLAMP && cgraph->nodes[node_idx + 4]->op == GGML_OP_GLU) {
+                fprintf(stderr, "clamp_fuse reject [subgraph try_op=%d] %s:", (int) ops.begin()[0], cgraph->nodes[node_idx + 4]->name);
+                for (int k = 0; k < 5; ++k) {
+                    const ggml_tensor * n = cgraph->nodes[node_idx + k];
+                    fprintf(stderr, " {%s op=%d flags=%d uses=%d}", n->name, n->op, n->flags,
+                            ggml_node_get_use_count(cgraph, node_idx + k));
+                }
+                fprintf(stderr, "\n");
+            }
+            return false;
+        }
+
+        const ggml_tensor * glu        = cgraph->nodes[node_idx + 4];
+        const ggml_tensor * gate_clamp = glu->src[0];
+        const ggml_tensor * up_clamp   = glu->src[1];
+
+        if (gate_clamp && up_clamp) {
+            const ggml_tensor * ffn_gate = gate_clamp->src[0];
+            const ggml_tensor * ffn_up   = up_clamp->src[0];
+
+            if (ggml_cuda_should_fuse_mul_mat_clamp(ffn_up, ffn_gate, glu, up_clamp, gate_clamp)) {
+                int out_nodes[] = { node_idx + 4 };
+                const bool mem_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+                if (dbg && !mem_ok) fprintf(stderr, "clamp_fuse reject [memory ranges] %s\n", glu->name);
+                return mem_ok;
+            }
+        }
+        return false;
+    }
+
     if ((is_equal(mul_mat_id_glu_ops, ops) || is_equal(mul_mat_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         const ggml_tensor * ffn_gate = cgraph->nodes[node_idx];
@@ -3158,6 +3241,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    static bool disable_clamp_fusion = getenv("GGML_CUDA_DISABLE_CLAMP_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_CLAMP_FUSION"));
     if (disable_fusion) {
         return 0;
     }
@@ -3681,6 +3765,51 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = 3;
                 break;
             }
+        } else if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_CLAMP && !disable_clamp_fusion &&
+                   ggml_cuda_can_fuse(cgraph, i, { op, GGML_OP_CLAMP, op, GGML_OP_CLAMP, GGML_OP_GLU }, {})) {
+            ggml_tensor * glu        = cgraph->nodes[i + 4];
+            ggml_tensor * gate_clamp = glu->src[0];
+            ggml_tensor * up_clamp   = glu->src[1];
+            ggml_tensor * gate       = gate_clamp->src[0];
+            ggml_tensor * up         = up_clamp->src[0];
+
+            bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 2]) ||
+                      (gate == cgraph->nodes[i + 2] && up == cgraph->nodes[i]);
+
+            if (!ok) {
+                continue;
+            }
+
+            const ggml_tensor * src0 = up->src[0];
+            const ggml_tensor * src1 = up->src[1];
+            const ggml_tensor * ids  = up->src[2];
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.gate        = gate->src[0];
+            fusion_data.glu_op      = ggml_get_glu_op(glu);
+            fusion_data.has_clamp   = true;
+            fusion_data.clamp_limit = ggml_get_op_params_f32(up_clamp, 1);
+
+            static bool dbg_clamp = getenv("GGML_CLAMP_FUSION_DEBUG") != nullptr;
+
+            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                if (dbg_clamp) fprintf(stderr, "clamp_fuse FUSED [mmvf] %s\n", glu->name);
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 5;
+                break;
+            }
+
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+                if (dbg_clamp) fprintf(stderr, "clamp_fuse FUSED [mmvq] %s\n", glu->name);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 5;
+                break;
+            }
+
+            if (dbg_clamp) fprintf(stderr, "clamp_fuse no-dispatch %s (ne1=%d ne2=%d type=%d)\n",
+                    glu->name, (int) up->ne[1], (int) up->ne[2], (int) up->src[0]->type);
         }
     }
 
