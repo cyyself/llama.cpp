@@ -10005,6 +10005,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // deepseek-v4-flash hyper-connection mix (f32 split-k) and router shapes
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,  24, 1, 16384, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 1,  4096, {1, 1}, {1, 1}));
+    // deepseek-v4 MLA decode attention shape (576/512, 64 gqa heads, batch 1)
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {64, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {64, 1}, 2048, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
