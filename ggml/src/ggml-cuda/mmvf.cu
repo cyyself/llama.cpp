@@ -413,6 +413,57 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+// split-k path for skinny f32 matvecs that underfill the GPU (e.g. hyper-connection mixes: 24 rows on 40 CUs)
+template <int block_size>
+static __global__ void mul_mat_vec_f_split_k(
+        const float * GGML_CUDA_RESTRICT x, const float * GGML_CUDA_RESTRICT y, float * GGML_CUDA_RESTRICT partials,
+        const int ncols4, const int64_t stride_row4, const int slice4) {
+    const int row = blockIdx.x;
+    const int c0  = blockIdx.y * slice4;
+    const int c1  = min(ncols4, c0 + slice4);
+
+    const float4 * x4 = (const float4 *) x + row*stride_row4;
+    const float4 * y4 = (const float4 *) y;
+
+    float sum = 0.0f;
+    for (int c = c0 + (int) threadIdx.x; c < c1; c += block_size) {
+        const float4 xv = x4[c];
+        const float4 yv = y4[c];
+        sum += xv.x*yv.x + xv.y*yv.y + xv.z*yv.z + xv.w*yv.w;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    sum = warp_reduce_sum<warp_size>(sum);
+
+    __shared__ float buf[block_size/warp_size];
+    const int wid = threadIdx.x / warp_size;
+    const int lid = threadIdx.x % warp_size;
+    if (lid == 0) {
+        buf[wid] = sum;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        sum = lid < block_size/warp_size ? buf[lid] : 0.0f;
+        sum = warp_reduce_sum<warp_size>(sum);
+        if (lid == 0) {
+            partials[blockIdx.y*gridDim.x + row] = sum;
+        }
+    }
+}
+
+static __global__ void mul_mat_vec_f_split_k_reduce(
+        const float * GGML_CUDA_RESTRICT partials, float * GGML_CUDA_RESTRICT dst, const int nrows, const int nsplits) {
+    const int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < nsplits; ++i) {
+        sum += partials[i*nrows + row];
+    }
+    dst[row] = sum;
+}
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -703,6 +754,39 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    {
+        static bool dbg = getenv("GGML_MMVF_SHAPE_DEBUG") != nullptr;
+        if (dbg) {
+            fprintf(stderr, "mmvf_shape: %s type=%d ne0=%ld ne1=%ld ne2=%ld ne3=%ld src1[%ld,%ld,%ld] dst=%s\n",
+                    src0->name, (int) src0->type, (long) ne00, (long) ne01, (long) ne02, (long) ne03,
+                    (long) ne10, (long) ne11, (long) ne12, dst->name);
+        }
+    }
+
+    if (!ids && !fusion && src0->type == GGML_TYPE_F32 &&
+            ne1 == 1 && ne2 == 1 && ne3 == 1 && ne02 == 1 && ne03 == 1 &&
+            ne00 % 4 == 0 && s01 % 4 == 0 && ne00 >= 8192) {
+        const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        if (ne01 < 2*nsm) {
+            const int nrows   = ne01;
+            const int nsplits = std::min<int>(16, (int) ((2*nsm + nrows - 1) / nrows));
+            const int ncols4  = ne00 / 4;
+            const int slice4  = (ncols4 + nsplits - 1) / nsplits;
+
+            ggml_cuda_pool_alloc<float> partials(ctx.pool(), (size_t) nrows * nsplits);
+
+            constexpr int block_size = 256;
+            const dim3 grid(nrows, nsplits, 1);
+            mul_mat_vec_f_split_k<block_size><<<grid, block_size, 0, ctx.stream()>>>(
+                    (const float *) src0->data, src1_d, partials.get(), ncols4, s01/4, slice4);
+
+            constexpr int rblock = 128;
+            mul_mat_vec_f_split_k_reduce<<<(nrows + rblock - 1)/rblock, rblock, 0, ctx.stream()>>>(
+                    partials.get(), dst_d, nrows, nsplits);
+            return;
+        }
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
