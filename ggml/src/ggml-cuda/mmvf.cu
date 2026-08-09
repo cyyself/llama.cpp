@@ -451,6 +451,54 @@ static __global__ void mul_mat_vec_f_split_k(
     }
 }
 
+// bf16 small-weight matvec (e.g. moe router): batch rows per block, split columns for occupancy
+template <int block_size, int rows_per_block>
+static __global__ void mul_mat_vec_bf16_rows_split(
+        const nv_bfloat16 * GGML_CUDA_RESTRICT x, const float * GGML_CUDA_RESTRICT y, float * GGML_CUDA_RESTRICT partials,
+        const int ncols2, const int64_t stride_row2, const int slice2, const int nrows) {
+    const int row0 = blockIdx.x*rows_per_block;
+    const int c0   = blockIdx.y*slice2;
+    const int c1   = min(ncols2, c0 + slice2);
+
+    const float2       * y2 = (const float2 *)       y;
+    const nv_bfloat162 * x2 = (const nv_bfloat162 *) x;
+
+    float sum[rows_per_block] = {0.0f};
+
+    for (int c = c0 + (int) threadIdx.x; c < c1; c += block_size) {
+        const float2 yv = y2[c];
+#pragma unroll
+        for (int r = 0; r < rows_per_block; ++r) {
+            const nv_bfloat162 xv = x2[(row0 + r)*stride_row2 + c];
+            ggml_cuda_mad(sum[r], xv.x, yv.x);
+            ggml_cuda_mad(sum[r], xv.y, yv.y);
+        }
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int wid = threadIdx.x / warp_size;
+    const int lid = threadIdx.x % warp_size;
+    __shared__ float buf[rows_per_block][block_size/warp_size];
+#pragma unroll
+    for (int r = 0; r < rows_per_block; ++r) {
+        sum[r] = warp_reduce_sum<warp_size>(sum[r]);
+        if (lid == 0) {
+            buf[r][wid] = sum[r];
+        }
+    }
+    __syncthreads();
+    if (wid == 0) {
+#pragma unroll
+        for (int r = 0; r < rows_per_block; ++r) {
+            float s = lid < block_size/warp_size ? buf[r][lid] : 0.0f;
+            s = warp_reduce_sum<warp_size>(s);
+            if (lid == 0) {
+                partials[blockIdx.y*nrows + row0 + r] = s;
+            }
+        }
+    }
+}
+
 static __global__ void mul_mat_vec_f_split_k_reduce(
         const float * GGML_CUDA_RESTRICT partials, float * GGML_CUDA_RESTRICT dst, const int nrows, const int nsplits) {
     const int row = blockIdx.x*blockDim.x + threadIdx.x;
@@ -786,6 +834,31 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
                     partials.get(), dst_d, nrows, nsplits);
             return;
         }
+    }
+
+    if (!ids && !fusion && src0->type == GGML_TYPE_BF16 &&
+            ne1 == 1 && ne2 == 1 && ne3 == 1 && ne02 == 1 && ne03 == 1 &&
+            ne00 % 2 == 0 && s01 % 2 == 0 && ne00 >= 2048 && ne01 % 4 == 0 && ne00*ne01*2 <= (8<<20)) {
+        const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+
+        const int nrows     = ne01;
+        constexpr int nrpb  = 4;
+        const int nblocks_x = nrows / nrpb;
+        const int nsplits   = std::min<int>(16, std::max<int>(1, (2*nsm + nblocks_x - 1) / nblocks_x));
+        const int ncols2    = ne00 / 2;
+        const int slice2    = (ncols2 + nsplits - 1) / nsplits;
+
+        ggml_cuda_pool_alloc<float> partials(ctx.pool(), (size_t) nrows * nsplits);
+
+        constexpr int block_size = 256;
+        const dim3 grid(nblocks_x, nsplits, 1);
+        mul_mat_vec_bf16_rows_split<block_size, nrpb><<<grid, block_size, 0, ctx.stream()>>>(
+                (const nv_bfloat16 *) src0->data, src1_d, partials.get(), ncols2, s01/2, slice2, nrows);
+
+        constexpr int rblock = 128;
+        mul_mat_vec_f_split_k_reduce<<<(nrows + rblock - 1)/rblock, rblock, 0, ctx.stream()>>>(
+                partials.get(), dst_d, nrows, nsplits);
+        return;
     }
 
     switch (src0->type) {
